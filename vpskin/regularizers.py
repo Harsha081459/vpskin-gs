@@ -36,9 +36,18 @@ def knn_graph(xyz: torch.Tensor, k: int = 8, radius: float | None = None, chunk:
     return e, rest
 
 
-def _rel_stretch(xyz_posed: torch.Tensor, edges: torch.Tensor, rest: torch.Tensor, eps: float = 1e-6):
+def edge_lengths(xyz: torch.Tensor, edges: torch.Tensor) -> torch.Tensor:
+    """Differentiable edge lengths; use with the *current* canonical xyz as the rest state."""
+    return (xyz[edges[:, 0]] - xyz[edges[:, 1]]).norm(dim=1)
+
+
+MIN_REST = 1e-3   # metres. GauHuman's clone-densification creates exactly coincident Gaussians
+                  # (rest length 0); relative stretch is measured against max(rest, 1 mm)
+
+
+def _rel_stretch(xyz_posed: torch.Tensor, edges: torch.Tensor, rest: torch.Tensor, min_rest: float = MIN_REST):
     cur = (xyz_posed[edges[:, 0]] - xyz_posed[edges[:, 1]]).norm(dim=1)
-    return (cur - rest) / (rest + eps)
+    return (cur - rest) / rest.clamp_min(min_rest)
 
 
 def iso_loss(xyz_posed: torch.Tensor, edges: torch.Tensor, rest: torch.Tensor, delta: float = 0.05):
@@ -64,6 +73,13 @@ def beta_smooth_loss(beta: torch.Tensor, edges: torch.Tensor):
 def neighbour_drift(xyz_posed: torch.Tensor, edges: torch.Tensor, rest: torch.Tensor):
     """E5 metric D_nn: mean |relative edge-length change|. Use a k different from training."""
     return _rel_stretch(xyz_posed, edges, rest).abs().mean()
+
+
+@torch.no_grad()
+def drift_stats(xyz_posed: torch.Tensor, edges: torch.Tensor, rest: torch.Tensor, tear: float = 0.5) -> dict:
+    """E5: mean / median |relative edge stretch| and tear rate (fraction of edges stretched > `tear`)."""
+    r = _rel_stretch(xyz_posed, edges, rest).abs()
+    return {"drift": r.mean().item(), "drift_median": r.median().item(), "tear": (r > tear).float().mean().item()}
 
 
 @torch.no_grad()

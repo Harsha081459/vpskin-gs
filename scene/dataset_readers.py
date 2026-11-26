@@ -226,7 +226,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             norm_data = im_data / 255.0
             arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+            image = Image.fromarray(np.clip(arr*255.0, 0, 255).astype(np.uint8))  # [vpskin] Pillow>=13 safe, same bytes
 
             fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
             FovY = fovy 
@@ -414,7 +414,7 @@ def readCamerasMonoCapdata(path, output_view, white_background, image_scaling=1.
                 msk = cv2.resize(msk, (W, H), interpolation=cv2.INTER_NEAREST)
                 K[:2] = K[:2] * ratio
 
-            image = Image.fromarray(np.array(image*255.0, dtype=np.byte), "RGB")
+            image = Image.fromarray(np.clip(image*255.0, 0, 255).astype(np.uint8))  # [vpskin] Pillow>=13 safe, same bytes
 
             focalX = K[0,0]
             focalY = K[1,1]
@@ -447,8 +447,8 @@ def readCamerasMonoCapdata(path, output_view, white_background, image_scaling=1.
             # get bounding mask and bcakground mask
             bound_mask = get_bound_2d_mask(world_bound, K, w2c[:3], image.size[1], image.size[0])
 
-            bound_mask = Image.fromarray(np.array(bound_mask*255.0, dtype=np.byte))
-            bkgd_mask = Image.fromarray(np.array(msk*255.0, dtype=np.byte))
+            bound_mask = Image.fromarray(np.clip(bound_mask*255.0, 0, 255).astype(np.uint8))  # [vpskin] Pillow>=13 safe, same bytes
+            bkgd_mask = Image.fromarray(np.clip(msk*255.0, 0, 255).astype(np.uint8))  # [vpskin] Pillow>=13 safe, same bytes
             cam_infos.append(CameraInfo(uid=idx, pose_id=pose_index, R=R, T=T, K=K, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, bkgd_mask=bkgd_mask, 
                             bound_mask=bound_mask, width=image.size[0], height=image.size[1], 
@@ -546,7 +546,7 @@ def get_camera_extrinsics_zju_mocap_refine(view_index, val=False, camera_view_nu
         extrinsics = lookat(eye, at, np.array([0, 0, -1])).astype(np.float32)
     return extrinsics
 
-def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling=0.5, split='train', novel_view_vis=False):
+def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling=0.5, split='train', novel_view_vis=False, frames=None):
     cam_infos = []
 
     pose_start = 0
@@ -560,15 +560,21 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
 
     ann_file = os.path.join(path, 'annots.npy')
     annots = np.load(ann_file, allow_pickle=True).item()
+    # [vpskin] explicit frame list (split files); default keeps GauHuman's start/interval/num
+    if frames is not None:
+        frame_ims = [annots['ims'][f] for f in frames]
+        pose_num = len(frames)
+    else:
+        frame_ims = frame_ims
     cams = annots['cams']
     ims = np.array([
         np.array(ims_data['ims'])[output_view]
-        for ims_data in annots['ims'][pose_start:pose_start + pose_num * pose_interval][::pose_interval]
+        for ims_data in frame_ims
     ])
 
     cam_inds = np.array([
         np.arange(len(ims_data['ims']))[output_view]
-        for ims_data in annots['ims'][pose_start:pose_start + pose_num * pose_interval][::pose_interval]
+        for ims_data in frame_ims
     ])
 
     if 'CoreView_313' in path or 'CoreView_315' in path:
@@ -651,7 +657,7 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
                 msk = cv2.resize(msk, (W, H), interpolation=cv2.INTER_NEAREST)
                 K[:2] = K[:2] * ratio
 
-            image = Image.fromarray(np.array(image*255.0, dtype=np.byte), "RGB")
+            image = Image.fromarray(np.clip(image*255.0, 0, 255).astype(np.uint8))  # [vpskin] Pillow>=13 safe, same bytes
 
             focalX = K[0,0]
             focalY = K[1,1]
@@ -680,9 +686,9 @@ def readCamerasZJUMoCapRefine(path, output_view, white_background, image_scaling
 
             # get bounding mask and bcakground mask
             bound_mask = get_bound_2d_mask(world_bound, K, w2c[:3], image.size[1], image.size[0])
-            bound_mask = Image.fromarray(np.array(bound_mask*255.0, dtype=np.byte))
+            bound_mask = Image.fromarray(np.clip(bound_mask*255.0, 0, 255).astype(np.uint8))  # [vpskin] Pillow>=13 safe, same bytes
 
-            bkgd_mask = Image.fromarray(np.array(msk*255.0, dtype=np.byte))
+            bkgd_mask = Image.fromarray(np.clip(msk*255.0, 0, 255).astype(np.uint8))  # [vpskin] Pillow>=13 safe, same bytes
 
             cam_infos.append(CameraInfo(uid=idx, pose_id=pose_index, R=R, T=T, K=K, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, bkgd_mask=bkgd_mask, 
@@ -864,7 +870,7 @@ def readCamerasDNARendering(path, output_view, white_background, image_scaling=0
                 msk = cv2.resize(msk, (W, H), interpolation=cv2.INTER_NEAREST)
                 K[:2] = K[:2] * ratio
 
-            image = Image.fromarray(np.array(image*255.0, dtype=np.byte), "RGB")
+            image = Image.fromarray(np.clip(image*255.0, 0, 255).astype(np.uint8))  # [vpskin] Pillow>=13 safe, same bytes
 
             focalX = K[0,0]
             focalY = K[1,1]
@@ -935,8 +941,8 @@ def readCamerasDNARendering(path, output_view, white_background, image_scaling=0
             # get bounding mask and bcakground mask
             bound_mask = get_bound_2d_mask(world_bound, K, w2c[:3], image.size[1], image.size[0])
 
-            bound_mask = Image.fromarray(np.array(bound_mask*255.0, dtype=np.byte))
-            bkgd_mask = Image.fromarray(np.array(msk*255.0, dtype=np.byte))
+            bound_mask = Image.fromarray(np.clip(bound_mask*255.0, 0, 255).astype(np.uint8))  # [vpskin] Pillow>=13 safe, same bytes
+            bkgd_mask = Image.fromarray(np.clip(msk*255.0, 0, 255).astype(np.uint8))  # [vpskin] Pillow>=13 safe, same bytes
 
             cam_infos.append(CameraInfo(uid=idx, pose_id=pose_index, R=R, T=T, K=K, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, bkgd_mask=bkgd_mask, 
@@ -1052,7 +1058,53 @@ def get_mask(path, index, view_index, ims):
 
     return msk, msk_cihp
 
+def _expand_frames(spec):
+    """[vpskin] frames as a list or {"start", "stop", "step"} (stop exclusive)."""
+    if isinstance(spec, dict):
+        return list(range(spec["start"], spec["stop"], spec.get("step", 1)))
+    return [int(f) for f in spec]
+
+
+def readSplitFileInfo(path, split_file, white_background, output_path, eval):
+    """[vpskin] ZJU-MoCap-format data with train/test views+frames from a json split file.
+
+    {"image_scaling": 0.5,
+     "train": {"views": [4], "frames": {"start": 0, "stop": 500, "step": 5}},
+     "test":  {"views": [0, 1, ...], "frames": [500, 530, ...]}}
+    Used for: synthetic SMPL data, ZJU novel-pose extension (E3), converted People-Snapshot.
+    """
+    import json
+    with open(split_file) as f:
+        sp = json.load(f)
+    scale = sp.get("image_scaling", 0.5)
+    print(f"[vpskin] split file {split_file}: train views {sp['train']['views']}, test views {sp['test']['views']}")
+    train_cam_infos = readCamerasZJUMoCapRefine(path, sp["train"]["views"], white_background, image_scaling=scale,
+                                                split='train', frames=_expand_frames(sp["train"]["frames"]))
+    test_cam_infos = readCamerasZJUMoCapRefine(path, sp["test"]["views"], white_background, image_scaling=scale,
+                                               split='test', frames=_expand_frames(sp["test"]["frames"]))
+    if not eval:
+        train_cam_infos.extend(test_cam_infos)
+        test_cam_infos = []
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    if len(sp["train"]["views"]) == 1:
+        nerf_normalization['radius'] = 1
+    ply_path = os.path.join('output', output_path, "points3d.ply")
+    if not os.path.exists(ply_path):
+        os.makedirs(os.path.dirname(ply_path), exist_ok=True)
+        xyz = train_cam_infos[0].big_pose_world_vertex
+        num_pts = xyz.shape[0]
+        shs = np.random.random((num_pts, 3)) / 255.0
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    try:
+        pcd = fetchPly(ply_path)
+    except Exception:
+        pcd = None
+    return SceneInfo(point_cloud=pcd, train_cameras=train_cam_infos, test_cameras=test_cam_infos,
+                     nerf_normalization=nerf_normalization, ply_path=ply_path)
+
+
 sceneLoadTypeCallbacks = {
+    "SplitFile": readSplitFileInfo,
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
     "ZJU_MoCap_refine" : readZJUMoCapRefineInfo,

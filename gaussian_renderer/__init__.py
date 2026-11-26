@@ -15,7 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, return_smpl_rot=False, transforms=None, translation=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, return_smpl_rot=False, transforms=None, translation=None, transforms_cov=None):
     """
     Render the scene. 
     
@@ -55,6 +55,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         _, means3D, _, transforms, _ = pc.coarse_deform_c2source(means3D[None], viewpoint_camera.smpl_param,
             viewpoint_camera.big_pose_smpl_param,
             viewpoint_camera.big_pose_world_vertex[None])
+        transforms_cov = pc.last_transforms_cov
     else:
         if transforms is None:
             # pose offset
@@ -70,9 +71,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             _, means3D, _, transforms, translation = pc.coarse_deform_c2source(means3D[None], viewpoint_camera.smpl_param,
                 viewpoint_camera.big_pose_smpl_param,
                 viewpoint_camera.big_pose_world_vertex[None], lbs_weights=lbs_weights, correct_Rs=correct_Rs, return_transl=return_smpl_rot)
+            transforms_cov = pc.last_transforms_cov  # [vpskin] differs from `transforms` only for quatavg
         else:
             correct_Rs = None
             means3D = torch.matmul(transforms, means3D[..., None]).squeeze(-1) + translation
+            if transforms_cov is None:
+                transforms_cov = transforms
 
 
     means3D = means3D.squeeze()
@@ -85,7 +89,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rotations = None
     cov3D_precomp = None
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier, transforms.squeeze())
+        cov3D_precomp = pc.get_covariance(scaling_modifier, transforms_cov.squeeze())
         # cov3D_precomp = pc.get_covariance(scaling_modifier)
     else:
         scales = pc.get_scaling
@@ -127,5 +131,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "visibility_filter" : radii > 0,
             "radii": radii,
             "transforms": transforms,
+            "transforms_cov": transforms_cov,
             "translation": translation,
             "correct_Rs": correct_Rs,}

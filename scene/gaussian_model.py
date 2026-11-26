@@ -28,6 +28,8 @@ import pickle
 import torch.nn.functional as F
 from nets.mlp_delta_body_pose import BodyPoseRefiner
 from nets.mlp_delta_weight_lbs import LBSOffsetDecoder
+from nets.beta_field import BetaField
+from vpskin.skinning import skin
 
 class GaussianModel:
 
@@ -52,7 +54,7 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree : int, smpl_type : str, motion_offset_flag : bool, actor_gender: str):
+    def __init__(self, sh_degree : int, smpl_type : str, motion_offset_flag : bool, actor_gender: str, skin_mode: str = 'lbs', beta_init: float = 0.0):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
@@ -93,6 +95,13 @@ class GaussianModel:
             # load lbs weight module
             self.lweight_offset_decoder = LBSOffsetDecoder(total_bones=total_bones)
             self.lweight_offset_decoder.to(self.device)
+
+        # [vpskin] skinning mode and (for 'blend') the beta field
+        assert skin_mode in ('lbs', 'dqs', 'blend', 'quatavg'), skin_mode
+        self.skin_mode = skin_mode
+        self.beta_field = BetaField(init_logit=beta_init).to(self.device) if skin_mode == 'blend' else None
+        self.last_transforms_cov = None
+        self.last_beta = None
 
     def capture(self):
         return (
@@ -211,6 +220,8 @@ class GaussianModel:
                 {'params': self.pose_decoder.parameters(), 'lr': training_args.pose_refine_lr, "name": "pose_decoder"},
                 {'params': self.lweight_offset_decoder.parameters(), 'lr': training_args.lbs_offset_lr, "name": "lweight_offset_decoder"},
             ] 
+        if self.beta_field is not None:
+            l.append({'params': self.beta_field.parameters(), 'lr': training_args.beta_lr, "name": "beta_field"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -632,64 +643,75 @@ class GaussianModel:
         self.denom[update_filter] += 1
 
     def coarse_deform_c2source(self, query_pts, params, t_params, t_vertices, lbs_weights=None, correct_Rs=None, return_transl=False):
+        """Canonical (SMPL big pose) -> posed world space.
+
+        [vpskin] The two blends (inverse big->T, forward T->posed) go through
+        vpskin.skinning.skin(mode). mode='lbs' reproduces GauHuman exactly; 'dqs', 'blend'
+        and 'quatavg' are our variants. The position transform is returned as `transforms`
+        (unchanged API). The covariance transform (which differs for 'quatavg') is stored in
+        self.last_transforms_cov, and the blend map in self.last_beta.
+        """
         bs = query_pts.shape[0]
+        assert bs == 1, "vpskin deformation assumes batch size 1 (as GauHuman uses it)"
         joints_num = self.SMPL_NEUTRAL['weights'].shape[-1]
         vertices_num = t_vertices.shape[1]
+        mode = getattr(self, 'skin_mode', 'lbs')
+
         # Find nearest smpl vertex
         smpl_pts = t_vertices
-
         _, vert_ids = self.knn(smpl_pts.float(), query_pts.float())
         if lbs_weights is None:
-            bweights = self.SMPL_NEUTRAL['weights'][vert_ids].view(*vert_ids.shape[:2], joints_num)#.cuda() # [bs, points_num, joints_num]
+            bweights = self.SMPL_NEUTRAL['weights'][vert_ids].view(*vert_ids.shape[:2], joints_num)
         else:
             bweights = self.SMPL_NEUTRAL['weights'][vert_ids].view(*vert_ids.shape[:2], joints_num)
             bweights = torch.log(bweights + 1e-9) + lbs_weights
             bweights = F.softmax(bweights, dim=-1)
+        W = bweights[0]
+        beta = self.get_beta(query_pts[0].detach()) if mode == 'blend' else None
+        self.last_beta = beta
 
-        ### From Big To T Pose
-        big_pose_params = t_params
-        A, R, Th, joints = get_transform_params_torch(self.SMPL_NEUTRAL, big_pose_params)
-        A = torch.matmul(bweights, A.reshape(bs, joints_num, -1))
-        A = torch.reshape(A, (bs, -1, 4, 4))
-        query_pts = query_pts - A[..., :3, 3]
-        R_inv = torch.inverse(A[..., :3, :3].float())
-        query_pts = torch.matmul(R_inv, query_pts[..., None]).squeeze(-1)
+        ### From Big To T Pose (inverse skinning)
+        A, R, Th, joints = get_transform_params_torch(self.SMPL_NEUTRAL, t_params)
+        Mb, tb, Mcb = skin(W, A[0], mode, beta)
+        Mb_inv = torch.inverse(Mb.float())
+        Mcb_inv = Mb_inv if Mcb is Mb else torch.inverse(Mcb.float())
+        query_pts = torch.matmul(Mb_inv, (query_pts[0] - tb)[..., None]).squeeze(-1)[None]
 
         # transforms from Big To T Pose
-        transforms = R_inv
+        transforms = Mb_inv[None]
+        transforms_cov = Mcb_inv[None]
 
         # translation from Big To T Pose
         translation = None
-        if return_transl: 
-            translation = -A[..., :3, 3]
-            translation = torch.matmul(R_inv, translation[..., None]).squeeze(-1)
+        if return_transl:
+            translation = torch.matmul(Mb_inv, -tb[..., None]).squeeze(-1)[None]
 
         self.mean_shape = True
         if self.mean_shape:
 
             posedirs = self.SMPL_NEUTRAL['posedirs'].cuda().float()
-            pose_ = big_pose_params['poses']
+            pose_ = t_params['poses']
             ident = torch.eye(3).cuda().float()
             batch_size = pose_.shape[0]
             rot_mats = batch_rodrigues(pose_.view(-1, 3)).view([batch_size, -1, 3, 3])
-            pose_feature = (rot_mats[:, 1:, :, :] - ident).view([batch_size, -1])#.cuda()
+            pose_feature = (rot_mats[:, 1:, :, :] - ident).view([batch_size, -1])
             pose_offsets = torch.matmul(pose_feature.unsqueeze(1), posedirs.view(vertices_num*3, -1).transpose(1,0).unsqueeze(0)).view(batch_size, -1, 3)
-            pose_offsets = torch.gather(pose_offsets, 1, vert_ids.expand(-1, -1, 3)) # [bs, N_rays*N_samples, 3]
+            pose_offsets = torch.gather(pose_offsets, 1, vert_ids.expand(-1, -1, 3))
             query_pts = query_pts - pose_offsets
 
-            if return_transl: 
+            if return_transl:
                 translation -= pose_offsets
 
             # From mean shape to normal shape
-            shapedirs = self.SMPL_NEUTRAL['shapedirs'][..., :params['shapes'].shape[-1]]#.cuda()
+            shapedirs = self.SMPL_NEUTRAL['shapedirs'][..., :params['shapes'].shape[-1]]
             shape_offset = torch.matmul(shapedirs.unsqueeze(0), torch.reshape(params['shapes'].cuda(), (batch_size, 1, -1, 1))).squeeze(-1)
-            shape_offset = torch.gather(shape_offset, 1, vert_ids.expand(-1, -1, 3)) # [bs, N_rays*N_samples, 3]
+            shape_offset = torch.gather(shape_offset, 1, vert_ids.expand(-1, -1, 3))
             query_pts = query_pts + shape_offset
 
-            if return_transl: 
+            if return_transl:
                 translation += shape_offset
 
-            posedirs = self.SMPL_NEUTRAL['posedirs']#.cuda().float()
+            posedirs = self.SMPL_NEUTRAL['posedirs']
             pose_ = params['poses']
             ident = torch.eye(3).cuda().float()
             batch_size = pose_.shape[0]
@@ -700,38 +722,42 @@ class GaussianModel:
                 rot_mats_no_root = torch.matmul(rot_mats_no_root.reshape(-1, 3, 3), correct_Rs.reshape(-1, 3, 3)).reshape(-1, joints_num-1, 3, 3)
                 rot_mats = torch.cat([rot_mats[:, 0:1], rot_mats_no_root], dim=1)
 
-            pose_feature = (rot_mats[:, 1:, :, :] - ident).view([batch_size, -1])#.cuda()
+            pose_feature = (rot_mats[:, 1:, :, :] - ident).view([batch_size, -1])
             pose_offsets = torch.matmul(pose_feature.unsqueeze(1), posedirs.view(vertices_num*3, -1).transpose(1,0).unsqueeze(0)).view(batch_size, -1, 3)
-            pose_offsets = torch.gather(pose_offsets, 1, vert_ids.expand(-1, -1, 3)) # [bs, N_rays*N_samples, 3]
+            pose_offsets = torch.gather(pose_offsets, 1, vert_ids.expand(-1, -1, 3))
             query_pts = query_pts + pose_offsets
 
-            if return_transl: 
+            if return_transl:
                 translation += pose_offsets
 
-        # get tar_pts, smpl space source pose
+        # get tar_pts, smpl space source pose (forward skinning)
         A, R, Th, joints = get_transform_params_torch(self.SMPL_NEUTRAL, params, rot_mats=rot_mats)
-
         self.s_A = A
-        A = torch.matmul(bweights, self.s_A.reshape(bs, joints_num, -1))
-        A = torch.reshape(A, (bs, -1, 4, 4))
-        can_pts = torch.matmul(A[..., :3, :3], query_pts[..., None]).squeeze(-1)
-        smpl_src_pts = can_pts + A[..., :3, 3]
-        
-        transforms = torch.matmul(A[..., :3, :3], transforms)
+        Mt, tt, Mct = skin(W, A[0], mode, beta)
+        smpl_src_pts = (torch.matmul(Mt, query_pts[0][..., None]).squeeze(-1) + tt)[None]
 
-        if return_transl: 
-            translation = torch.matmul(A[..., :3, :3], translation[..., None]).squeeze(-1) + A[..., :3, 3]
+        transforms = torch.matmul(Mt, transforms)
+        transforms_cov = torch.matmul(Mct, transforms_cov)
+
+        if return_transl:
+            translation = (torch.matmul(Mt, translation[0][..., None]).squeeze(-1) + tt)[None]
 
         # transform points from the smpl space to the world space
         R_inv = torch.inverse(R)
         world_src_pts = torch.matmul(smpl_src_pts, R_inv) + Th
-        
-        transforms = torch.matmul(R, transforms)
 
-        if return_transl: 
+        transforms = torch.matmul(R, transforms)
+        transforms_cov = torch.matmul(R, transforms_cov)
+        self.last_transforms_cov = transforms_cov
+
+        if return_transl:
             translation = torch.matmul(translation, R_inv).squeeze(-1) + Th
 
         return smpl_src_pts, world_src_pts, bweights, transforms, translation
+
+    # [vpskin] learned LBS<->DQS blend map beta(x) in [0,1], a field over canonical space (C2)
+    def get_beta(self, xyz):
+        return torch.sigmoid(self.beta_field(xyz[None]).reshape(-1))
 
 def read_pickle(pkl_path):
     with open(pkl_path, 'rb') as f:

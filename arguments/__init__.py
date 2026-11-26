@@ -58,6 +58,10 @@ class ModelParams(ParamGroup):
         self.smpl_type = "smplx"
         self.actor_gender = "neutral"
         self.motion_offset_flag = False
+        # [vpskin]
+        self.skin_mode = "lbs"          # lbs | dqs | blend | quatavg
+        self.split_file = ""            # optional json overriding train/test views+frames
+        self.beta_init = 0.0            # blend-field initial logit (0 -> beta=0.5; -4 -> ~LBS)
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -92,6 +96,17 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 400 #500
         self.densify_until_iter = 1000 #15_000
         self.densify_grad_threshold = 0.0002
+        # [vpskin] image-free regularisation (C3)
+        self.reg_poses = "none"         # none | train | train_noise | amass
+        self.pose_bank = ""             # .npy (P, 72) pose bank for reg_poses=amass
+        self.reg_noise_std = 0.1        # train_noise: N(0, std) on body joints (3DGS-Avatar style)
+        self.lambda_iso = 0.0
+        self.lambda_vol = 0.0
+        self.reg_knn = 8
+        self.reg_iso_delta = 0.05
+        self.reg_every = 1
+        self.reg_from_iter = 0
+        self.beta_lr = 0.001
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

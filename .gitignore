@@ -18,3 +18,4 @@ data/amass*
 __pycache__/
 .pytest_cache/
 !results/**/*.png
+*.egg-info/

@@ -206,3 +206,37 @@ def test_knn_fallback_matches_cdist():
     _, idx = KNN(k=1, chunk=64)(ref, q)
     assert idx.shape == (1, 300, 1)
     assert torch.equal(idx[0, :, 0], torch.cdist(q[0], ref[0]).argmin(1))
+
+
+def test_pose_sampler_modes(tmp_path):
+    import numpy as np
+    from vpskin.pose_prior import PoseSampler, amass_to_smpl72
+    bank = amass_to_smpl72(np.random.default_rng(0).normal(0, 0.3, (50, 156)))
+    np.save(tmp_path / "bank.npy", bank)
+    s = PoseSampler("amass", bank_path=str(tmp_path / "bank.npy"), device="cpu")
+    p = s.sample()
+    assert p.shape == (1, 72) and torch.all(p[:, :3] == 0) and torch.all(p[:, 66:] == 0)
+    tp = torch.randn(10, 72)
+    s2 = PoseSampler("train_noise", train_poses=tp, noise_std=0.1, device="cpu")
+    q = s2.sample()
+    assert torch.all(q[:, :3] == 0)
+    d = (q[:, 3:] - tp[:, 3:]).abs().min(0).values      # noisy copy of some training pose
+    assert q.shape == (1, 72)
+
+
+def test_drift_robust_to_coincident_points():
+    x = torch.rand(200, 3, generator=GEN)
+    x = torch.cat([x, x[:50]])                      # exact duplicates, as after clone-densification
+    e, rest = knn_graph(x, k=8)
+    y = x + 0.001 * torch.randn(x.shape, generator=GEN)
+    assert neighbour_drift(y, e, rest).item() < 5.0  # bounded (was ~1e3 with eps=1e-6)
+    assert torch.isfinite(iso_loss(y, e, rest))
+
+
+def test_drift_stats():
+    from vpskin.regularizers import drift_stats
+    x = torch.rand(300, 3, generator=GEN)
+    e, rest = knn_graph(x, k=8)
+    y = x.clone(); y[:10] += 1.0                      # tear a few points away
+    d = drift_stats(y, e, rest)
+    assert 0 < d["tear"] < 0.2 and d["drift_median"] < 1e-9 and d["drift"] > 0

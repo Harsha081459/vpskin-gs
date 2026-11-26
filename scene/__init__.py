@@ -42,7 +42,12 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        split_file = getattr(args, "split_file", "") or ""
+        if not split_file and os.path.exists(os.path.join(args.source_path, "split.json")):
+            split_file = os.path.join(args.source_path, "split.json")
+        if split_file:  # [vpskin] explicit views/frames (synthetic, novel-pose, People-Snapshot)
+            scene_info = sceneLoadTypeCallbacks["SplitFile"](args.source_path, split_file, args.white_background, args.exp_name, args.eval)
+        elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
@@ -99,6 +104,8 @@ class Scene:
                 ckpt = torch.load(model_path, map_location='cuda:0')
                 self.gaussians.pose_decoder.load_state_dict(ckpt['pose_decoder'])
                 self.gaussians.lweight_offset_decoder.load_state_dict(ckpt['lweight_offset_decoder'])
+                if self.gaussians.beta_field is not None:
+                    self.gaussians.beta_field.load_state_dict(ckpt['beta_field'])
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
@@ -111,6 +118,7 @@ class Scene:
                 'iter': iteration,
                 'pose_decoder': self.gaussians.pose_decoder.state_dict(),
                 'lweight_offset_decoder': self.gaussians.lweight_offset_decoder.state_dict(),
+                'beta_field': self.gaussians.beta_field.state_dict() if self.gaussians.beta_field is not None else None,
             }, model_path)
 
     def getTrainCameras(self, scale=1.0):

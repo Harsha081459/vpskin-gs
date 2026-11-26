@@ -37,13 +37,27 @@ loss_fn_vgg = lpips.LPIPS(net='vgg').to(torch.device('cuda', torch.cuda.current_
 
 import time
 import torch.nn.functional as F
+from vpskin.pose_prior import PoseSampler
+from vpskin.regularizers import knn_graph, edge_lengths, iso_loss, vol_loss
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree, dataset.smpl_type, dataset.motion_offset_flag, dataset.actor_gender)
+    gaussians = GaussianModel(dataset.sh_degree, dataset.smpl_type, dataset.motion_offset_flag, dataset.actor_gender, skin_mode=dataset.skin_mode, beta_init=getattr(dataset, 'beta_init', 0.0))
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+
+    # [vpskin] image-free regulariser at sampled poses (C3)
+    reg = None
+    if opt.reg_poses != "none" and (opt.lambda_iso > 0 or opt.lambda_vol > 0):
+        train_cams = scene.getTrainCameras()
+        train_poses = torch.cat([c.smpl_param['poses'].reshape(1, -1) for c in train_cams], 0)
+        reg = {"sampler": PoseSampler(opt.reg_poses, train_poses, opt.pose_bank, opt.reg_noise_std),
+               "cam": train_cams[0], "edges": None, "n": -1,
+               "R": torch.eye(3, device="cuda"), "Th": torch.zeros(1, 3, device="cuda")}
+        print(f"[vpskin] regulariser: poses={opt.reg_poses} ({len(reg['sampler'])}) "
+              f"lambda_iso={opt.lambda_iso} lambda_vol={opt.lambda_vol} skin={dataset.skin_mode}")
+    reg_iso_log, reg_vol_log = 0.0, 0.0
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -121,6 +135,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         lpips_loss = loss_fn_vgg(img_pred, img_gt).reshape(-1)
 
         loss = Ll1 + 0.1 * mask_loss + 0.01 * (1.0 - ssim_loss) + 0.01 * lpips_loss
+
+        # [vpskin] C3: deform canonical Gaussians to a sampled pose (no rendering) and penalise
+        # neighbour-distance change (L_iso) and per-Gaussian volume change (L_vol)
+        if reg is not None and iteration >= opt.reg_from_iter and iteration % opt.reg_every == 0:
+            xyz = gaussians.get_xyz
+            # rebuild the canonical kNN graph whenever indices may have changed: right after each
+            # densify/prune step (prune+clone can keep N but reorder points) or if N changed
+            if reg["n"] != xyz.shape[0] or (iteration - 1) % opt.densification_interval == 0:
+                reg["edges"], _ = knn_graph(xyz.detach(), k=opt.reg_knn)
+                reg["n"] = xyz.shape[0]
+            cam = reg["cam"]
+            params = {"poses": reg["sampler"].sample(), "shapes": cam.smpl_param["shapes"],
+                      "R": reg["R"], "Th": reg["Th"]}
+            lbs_w = gaussians.lweight_offset_decoder(xyz[None].detach()).permute(0, 2, 1) if gaussians.motion_offset_flag else None
+            _, posed, _, _, _ = gaussians.coarse_deform_c2source(
+                xyz[None], params, cam.big_pose_smpl_param, cam.big_pose_world_vertex[None],
+                lbs_weights=lbs_w, correct_Rs=None)
+            rest = edge_lengths(xyz, reg["edges"])
+            l_iso = iso_loss(posed[0], reg["edges"], rest, delta=opt.reg_iso_delta)
+            l_vol = vol_loss(gaussians.last_transforms_cov[0])
+            loss = loss + opt.lambda_iso * l_iso + opt.lambda_vol * l_vol
+            reg_iso_log = 0.4 * l_iso.item() + 0.6 * reg_iso_log
+            reg_vol_log = 0.4 * l_vol.item() + 0.6 * reg_vol_log
+
         loss.backward()
 
         # end time
@@ -142,7 +180,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             lpips_loss_for_log = 0.4 * lpips_loss.item() + 0.6 * lpips_loss_for_log
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"#pts": gaussians._xyz.shape[0], "Ll1 Loss": f"{Ll1_loss_for_log:.{3}f}", "mask Loss": f"{mask_loss_for_log:.{2}f}",
-                                          "ssim": f"{ssim_loss_for_log:.{2}f}", "lpips": f"{lpips_loss_for_log:.{2}f}"})
+                                          "ssim": f"{ssim_loss_for_log:.{2}f}", "lpips": f"{lpips_loss_for_log:.{2}f}",
+                                          "iso": f"{reg_iso_log:.{4}f}", "vol": f"{reg_vol_log:.{4}f}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -250,6 +289,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
                     smpl_rot[config['name']][viewpoint.pose_id]['transforms'] = render_output['transforms']
                     smpl_rot[config['name']][viewpoint.pose_id]['translation'] = render_output['translation']
+                    smpl_rot[config['name']][viewpoint.pose_id]['transforms_cov'] = render_output['transforms_cov']
 
                 l1_test /= len(config['cameras']) 
                 psnr_test /= len(config['cameras'])   
@@ -288,12 +328,16 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--seed", type=int, default=0, help="[vpskin] RNG seed (GauHuman fixes 0)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
     # Initialize system state (RNG)
     safe_state(args.quiet)
+    if args.seed:  # [vpskin] re-seed after GauHuman's fixed seeding
+        import random
+        random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed); torch.cuda.manual_seed_all(args.seed)
 
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)

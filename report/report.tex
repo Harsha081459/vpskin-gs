@@ -1,0 +1,127 @@
+\documentclass[10pt,twocolumn]{article}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,bm,booktabs,graphicx,xcolor,hyperref,cleveref}
+\newtheorem{proposition}{Proposition}
+\newcommand{\TODO}[1]{\textcolor{red}{[TODO: #1]}}
+\title{VP-Skin: Volume-Preserving Rigid Skinning and Unseen-Pose Regularisation\\for Articulated 3D Gaussian Avatars}
+\author{Harsha Vardhan Doppalapudi \TODO{teammate}\\ AID 836 3D Computer Vision, IIIT Bangalore --- Problem Statement 2}
+\date{}
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Animatable 3D Gaussian avatars skin every Gaussian with linear blend skinning (LBS), transforming its covariance as
+$\Sigma'=M\Sigma M^\top$ with $M=\sum_j w_jR_j$. We show that this scales each Gaussian's volume by
+$|\det M| = 1-2w(1-w)(1-\cos\theta)$ for two bones at relative angle $\theta$, which collapses to zero at $\theta=\pi$:
+the candy-wrapper artefact, quantified per primitive. We (C1) skin means \emph{and} covariances with dual quaternions,
+which is rigid and therefore exactly volume preserving; (C2) learn a smooth per-point blend between LBS and DQS; and
+(C3) regularise isometry and volume at \emph{unseen} poses sampled from AMASS, which requires no images. On top of
+GauHuman~\cite{gauhuman} we evaluate on ZJU-MoCap, People-Snapshot and a synthetic SMPL set with 3D ground truth.
+\TODO{one-sentence headline result from T1/T2}.
+\end{abstract}
+
+\section{Introduction}
+3D Gaussian Splatting (3DGS)~\cite{3dgs} renders in real time, but a trained model is a static set of primitives.
+Avatars such as GauHuman~\cite{gauhuman}, GART~\cite{gart} and 3DGS-Avatar~\cite{3dgsavatar} bind Gaussians to an
+SMPL~\cite{smpl} skeleton with LBS. Driving them with motions far from the training video exposes LBS's failure modes:
+volume loss at twisting and bending joints, and neighbouring Gaussians that drift apart (tears and ``needles'').
+Our contributions:
+(i) a closed-form, per-Gaussian analysis of LBS covariance skinning (Prop.~\ref{prop:lbs});
+(ii) rigid DQS skinning of $\mu$ and $\Sigma$ plus a learned LBS$\leftrightarrow$DQS blend field;
+(iii) image-free isometry and volume regularisers at AMASS poses disjoint from all test motions;
+(iv) a pre-registered ablation (9 variants) with peak VRAM and GPU-hours on free hardware (one T4, 16\,GB).
+
+\section{Related work}
+\textbf{Animatable Gaussians.} GauHuman~\cite{gauhuman} (LBS, pose refinement, KL split/merge), GART~\cite{gart},
+3DGS-Avatar~\cite{3dgsavatar} (non-rigid MLP, as-isometric-as-possible loss at training poses, pose-noise augmentation),
+SplattingAvatar~\cite{splattingavatar} and GaussianAvatars~\cite{gaussianavatars} (mesh-embedded), SAGA~\cite{saga}.
+\textbf{Skinning.} DQS~\cite{dqs} removes candy-wrapping but bulges at bends; ``On the skinning of Gaussian avatars''
+\cite{skinning_gs} blends Gaussian \emph{rotations} by quaternion averaging while keeping LBS means. They do not compare
+to DQS or analyse volume; we re-implement their rotation blending as baseline B1.
+\textbf{Rigidity priors.} Dynamic 3D Gaussians~\cite{dyn3dgs} penalise neighbour-distance change over time.
+
+\section{Background (course concepts)}
+A Gaussian $G_i=(\mu_i,\Sigma_i,\alpha_i,c_i)$ with $\Sigma_i=R_iS_iS_i^\top R_i^\top$ is projected with the camera
+model of L4--5/L14--15, $\Sigma^{2D}=JW\Sigma W^\top J^\top$, and alpha-composited (L24). SMPL's pose $\theta\in\mathbb{R}^{24\times3}$
+is axis-angle (Rodrigues, L8). Forward kinematics composes per-bone rigid motions $T_j=(R_j,t_j)\in SE(3)$ (L6--7).
+Skinning weights per primitive (L21) blend these transforms. GauHuman's canonical space is a ``big pose'' (star pose),
+so a deformation is inverse skinning (big pose to T-pose), pose/shape correctives, then forward skinning (posed).
+
+\section{Method}
+\subsection{LBS changes every Gaussian's volume}
+LBS sets $M_i=\sum_j w_{ij}R_j$, $\mu_i'=M_i\mu_i+\sum_j w_{ij}t_j$ and $\Sigma_i'=M_i\Sigma_iM_i^\top$. Since a Gaussian's
+volume is $\propto\sqrt{\det\Sigma}$, it scales by $|\det M_i|$.
+\begin{proposition}\label{prop:lbs}
+For two bones with $R_2=R_1R_\mathrm{rel}$, where $R_\mathrm{rel}$ rotates by $\theta$ about any unit axis $a$, and weights $(1-w,w)$:
+$\det M = 1-2w(1-w)(1-\cos\theta)\le1$. The singular values of $M$ are $(1,r,r)$ with $r^2=\det M$; the shrink is
+isotropic in the plane $\perp a$.
+\end{proposition}
+\begin{proof}
+$M=R_1\big((1-w)I+wR_\mathrm{rel}\big)$ and $\det R_1=1$. $R_\mathrm{rel}$ has eigenvalues $1,e^{\pm i\theta}$, so
+$(1-w)I+wR_\mathrm{rel}$ has eigenvalues $1$ and $\lambda_\pm=(1-w)+we^{\pm i\theta}$. Then
+$\det M=|\lambda_+|^2=(1-w)^2+w^2+2w(1-w)\cos\theta$. The matrix acts as the identity on $a$ and as a scaled rotation
+(modulus $|\lambda_+|$) on $a^\perp$, which gives the singular values.
+\end{proof}
+At $w=\tfrac12,\ \theta=\pi$, $\det M=0$. If $a$ lies along the bone (twist), the limb cross-section collapses; if
+$a\perp$ bone (bend), the joint collapses in the bend plane.
+
+\subsection{C1: rigid dual-quaternion skinning of $\mu$ and $\Sigma$}
+Each bone transform becomes a unit dual quaternion $\hat q_j$. We blend $\hat b_i=\sum_j w_{ij}s_{ij}\hat q_j/\|\cdot\|$
+(with $s_{ij}=\pm1$ aligning each bone to the hemisphere of the max-weight bone) and convert back to
+$(\tilde R_i,\tilde t_i)\in SE(3)$:
+\[\mu_i'=\tilde R_i\mu_i+\tilde t_i,\qquad \Sigma_i'=\tilde R_i\Sigma_i\tilde R_i^\top .\]
+\begin{proposition}\label{prop:dqs}
+$\det\Sigma_i'=\det\Sigma_i$: DQS preserves every Gaussian's volume exactly.
+\end{proposition}
+Both blends of GauHuman's deformation (inverse and forward) are replaced, so the composite map is rigid per Gaussian.
+
+\subsection{C2: learned LBS$\leftrightarrow$DQS blend field}
+DQS bulges at bends, while LBS collapses at twists. A coordinate MLP $\beta(x)\in[0,1]$ over canonical space, initialised
+at $\beta\approx0$ (the baseline), mixes the two:
+$\mu'=(1-\beta)\mu^\mathrm{LBS}+\beta\mu^\mathrm{DQS}$ and $M^\beta=(1-\beta)M+\beta\tilde R$, with $\Sigma'=M^\beta\Sigma M^{\beta\top}$.
+A field is smooth by construction and needs no bookkeeping under densification. It is graphics' ``weight-blended''
+skinning, learned instead of painted.
+
+\subsection{C3: image-free regularisation at unseen poses}
+The photometric loss constrains only the training poses. We sample $\tilde\theta$ from an AMASS bank (CMU), disjoint
+from the test motions (ACCAD, BMLmovi), deform the canonical Gaussians (no rendering), and penalise
+\begin{align*}
+\mathcal L_\mathrm{iso}&=\tfrac1{|E|}\textstyle\sum_{(i,k)\in E}\rho\!\left(\frac{\|\mu_i'-\mu_k'\|-\|\mu_i-\mu_k\|}{\|\mu_i-\mu_k\|}\right),\\
+\mathcal L_\mathrm{vol}&=\tfrac1N\textstyle\sum_i\big(\log|\det M_i^\beta(\tilde\theta)|\big)^2,
+\end{align*}
+with $E$ the canonical 8-NN graph and $\rho$ Charbonnier. $\mathcal L_\mathrm{vol}\equiv0$ for pure DQS. The total loss is
+$\mathcal L_\mathrm{GauHuman}+\lambda_\mathrm{iso}\mathcal L_\mathrm{iso}+\lambda_\mathrm{vol}\mathcal L_\mathrm{vol}$, with
+$\lambda_\mathrm{iso}=\TODO{0.1}$ and $\lambda_\mathrm{vol}=\TODO{0.01}$ fixed on validation only.
+
+\section{Experimental setup}
+\textbf{Baseline.} GauHuman @\texttt{732ec0d}, with its own metric code (PSNR, SSIM, LPIPS-VGG$\times10^3$). We only add
+\texttt{cuda.synchronize()} so FPS measures GPU time.
+\textbf{Protocols.}
+E1: ZJU-MoCap novel view (GauHuman split: train view 4, frames 0--495/5; test 22 views $\times$ 17 frames).
+E2: People-Snapshot novel pose (3DGS-Avatar split).
+E3: ZJU novel pose (frames after the training range; our extension, labelled as such).
+E4: synthetic textured SMPL driven by AMASS with 3D GT (Chamfer overall and within 10\,cm of joints).
+E5: held-out AMASS motions: neighbour drift ($k{=}16$; training uses $k{=}8$), per-part volume ratio, hole rate.
+E6: twist and bend sweeps.
+\textbf{Fairness.} Drift is related to $\mathcal L_\mathrm{iso}$, so we evaluate it on disjoint motions with a different
+$k$, and lead with metrics never used in training (GT Chamfer, PSNR, hole rate).
+\textbf{Compute.} One Kaggle T4 (16\,GB). \TODO{total GPU-h, peak VRAM from T3}.
+
+\section{Results}
+\TODO{\texttt{results/tables.tex} T1/T2 and Fig.~twist}.
+% \input{../results/tables.tex}
+% \begin{figure}\centering\includegraphics[width=\linewidth]{../results/figures/l_elbow_twist.png}
+% \caption{Mean $|\det M|$ in the elbow region vs twist angle; dashed: Prop.~1.}\end{figure}
+
+\section{Ablations and discussion}
+\TODO{B0 vs A1 (C1 alone); A2 vs A3 vs A3n (training poses vs pose noise vs AMASS prior); A4 vs A6 (blend); A6 vs A7;
+seeds.}
+
+\section{Limitations}
+SMPL-based synthetic ground truth inherits SMPL's own skinning (with learned correctives). Real-video metrics move
+little by design (predicted in our plan): test poses are close to training poses. Loose clothing is not modelled
+beyond GauHuman's capacity.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+\end{document}

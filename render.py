@@ -29,15 +29,21 @@ import lpips
 loss_fn_vgg = lpips.LPIPS(net='vgg').to(torch.device('cuda', torch.cuda.current_device()))
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+    tag = globals().get("TAG", "")
+    sub = name + (f"_{tag}" if tag else "")
+    render_path = os.path.join(model_path, sub, "ours_{}".format(iteration), "renders")
+    gts_path = os.path.join(model_path, sub, "ours_{}".format(iteration), "gt")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
 
     # Load data (deserialize)
-    with open(model_path + '/smpl_rot/' + f'iteration_{iteration}/' + 'smpl_rot.pickle', 'rb') as handle:
-        smpl_rot = pickle.load(handle)
+    smpl_rot = {}
+    rot_file = model_path + '/smpl_rot/' + f'iteration_{iteration}/' + 'smpl_rot.pickle'
+    if os.path.exists(rot_file):
+        with open(rot_file, 'rb') as handle:
+            smpl_rot = pickle.load(handle)
+    FRESH = globals().get("FRESH", False) or bool(tag)   # a tagged split = new frames -> fresh transforms
 
     rgbs = []
     rgbs_gt = []
@@ -46,11 +52,18 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     for _, view in enumerate(tqdm(views, desc="Rendering progress")):
         gt = view.original_image[0:3, :, :].cuda()
         bound_mask = view.bound_mask
-        transforms, translation = smpl_rot[name][view.pose_id]['transforms'], smpl_rot[name][view.pose_id]['translation']
+        # [vpskin] reuse the transforms cached at training time (GauHuman protocol); frames that were
+        # never seen in training (novel-pose splits) or --fresh_transforms compute them from the pose
+        cached = None if FRESH else smpl_rot.get(name, {}).get(view.pose_id)
+        if cached is not None:
+            transforms, translation = cached['transforms'], cached['translation']
+            transforms_cov = cached.get('transforms_cov', transforms)
+        else:
+            transforms = translation = transforms_cov = None
 
         # Start timer
         start_time = time.time() 
-        render_output = render(view, gaussians, pipeline, background, transforms=transforms, translation=translation)
+        render_output = render(view, gaussians, pipeline, background, transforms=transforms, translation=translation, transforms_cov=transforms_cov)
         rendering = render_output["render"]
         
         # end time  [vpskin] synchronize so FPS measures GPU work, not kernel launch
@@ -96,13 +109,14 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     out = {"split": name, "iteration": iteration, "n_views": len(views), "psnr": float(psnrs),
            "ssim": float(ssims), "lpips_vgg": float(lpipss), "lpips_x1000": 1000 * float(lpipss),
            "fps_sync": len(views) / elapsed_time, "n_gaussians": int(gaussians.get_xyz.shape[0])}
-    with open(os.path.join(model_path, f"metrics_{name}_{iteration}.json"), "w") as f:
+    out["tag"] = tag
+    with open(os.path.join(model_path, f"metrics_{sub}_{iteration}.json"), "w") as f:
         json.dump(out, f, indent=2)
     return out
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.sh_degree, dataset.smpl_type, dataset.motion_offset_flag, dataset.actor_gender)
+        gaussians = GaussianModel(dataset.sh_degree, dataset.smpl_type, dataset.motion_offset_flag, dataset.actor_gender, skin_mode=getattr(dataset, 'skin_mode', 'lbs'), beta_init=getattr(dataset, 'beta_init', 0.0))
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
@@ -123,7 +137,12 @@ if __name__ == "__main__":
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--fresh_transforms", action="store_true", help="[vpskin] ignore cached smpl_rot transforms")
+    parser.add_argument("--tag", type=str, default="", help="[vpskin] suffix for the metrics json / render folder")
     args = get_combined_args(parser)
+    # a different split file means different frames: never reuse cached per-frame transforms
+    FRESH = bool(args.fresh_transforms) or bool(getattr(args, "split_file", ""))
+    TAG = args.tag or (os.path.splitext(os.path.basename(args.split_file))[0] if getattr(args, "split_file", "") else "")
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
