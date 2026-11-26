@@ -53,7 +53,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         render_output = render(view, gaussians, pipeline, background, transforms=transforms, translation=translation)
         rendering = render_output["render"]
         
-        # end time
+        # end time  [vpskin] synchronize so FPS measures GPU work, not kernel launch
+        torch.cuda.synchronize()
         end_time = time.time()
         # Calculate elapsed time
         elapsed_time += end_time - start_time
@@ -90,6 +91,15 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     # evalution metrics
     print("\n[ITER {}] Evaluating {} #{}: PSNR {} SSIM {} LPIPS {}".format(iteration, name, len(views), psnrs, ssims, lpipss))
 
+    # [vpskin] persist metrics (the metric code above is GauHuman's, unchanged)
+    import json
+    out = {"split": name, "iteration": iteration, "n_views": len(views), "psnr": float(psnrs),
+           "ssim": float(ssims), "lpips_vgg": float(lpipss), "lpips_x1000": 1000 * float(lpipss),
+           "fps_sync": len(views) / elapsed_time, "n_gaussians": int(gaussians.get_xyz.shape[0])}
+    with open(os.path.join(model_path, f"metrics_{name}_{iteration}.json"), "w") as f:
+        json.dump(out, f, indent=2)
+    return out
+
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree, dataset.smpl_type, dataset.motion_offset_flag, dataset.actor_gender)
@@ -119,4 +129,7 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test)
+    # [vpskin] log peak VRAM / wall-clock for evaluation too
+    from utils.runlog import RunLog
+    with RunLog("render:" + args.model_path, config=vars(args)):
+        render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test)

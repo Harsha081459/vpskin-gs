@@ -20,7 +20,10 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-from knn_cuda import KNN
+try:  # [vpskin] knn_cuda JIT-compiles and often fails on new images; fall back to pure torch
+    from knn_cuda import KNN
+except Exception:
+    from vpskin.knn_fallback import KNN
 import pickle
 import torch.nn.functional as F
 from nets.mlp_delta_body_pose import BodyPoseRefiner

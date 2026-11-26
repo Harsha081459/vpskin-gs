@@ -1,110 +1,53 @@
-<div align="center">
+# VP-Skin: volume-preserving rigid skinning for articulated 3D Gaussians
 
-<h1>GauHuman: Articulated Gaussian Splatting from Monocular Human Videos</h1>
+AID 836 (3D Computer Vision, IIIT Bangalore) final project, Problem Statement 2.
+This is a fork of [GauHuman](https://github.com/skhu101/GauHuman) at commit `732ec0d`, which is our baseline. GauHuman's original README is [README_GauHuman.md](README_GauHuman.md).
+GauHuman is under the S-Lab License 1.0 (non-commercial), which this fork keeps. Our additions live in `vpskin/`, `tools/`, `tests/`, `notebooks/` and `utils/runlog.py`.
 
-<div>
-    <a href="https://skhu101.github.io" target="_blank">Shoukang Hu</a>;
-    <a href="https://liuziwei7.github.io/" target="_blank">Ziwei Liu</a>
-</div>
-<div>
-    S-Lab, Nanyang Technological University
-</div>
-<div>
-    CVPR 2024
-</div>
+> Status: **Day 2 of the plan (setup).** Skinning maths and logger are unit-tested. No experimental results yet.
 
-<div style="width: 70%; text-align: center; margin:auto;">
-    <img style="width:100%" src="assets_img/training_speed.gif"><br>
-    <em>GauHuman learns articulated Gaussian Splatting from monocular videos with both <strong>fast training</strong> (1~2 minutes) and <strong>real-time rendering</strong> (up to 189 FPS).</em>
-</div>
+## Idea in one paragraph
+GauHuman skins each Gaussian with linear blend skinning (LBS): M = Σ w_j R_j, μ' = Mμ + t, Σ' = MΣMᵀ.
+Each Gaussian's volume therefore scales by |det M|.
+For two bones with relative rotation θ about any axis and weights (1−w, w), that factor is **det M = 1 − 2w(1−w)(1 − cos θ)**. It reaches 0 at w = ½, θ = π: the candy-wrapper collapse, measured per Gaussian.
+We contribute:
+1. **C1:** dual-quaternion skinning of means and covariances. The motion is rigid, so volume is preserved exactly.
+2. **C2:** a learned per-Gaussian blend between LBS and DQS.
+3. **C3:** image-free isometry and volume penalties evaluated at **unseen AMASS poses** during training.
 
-:open_book: For more visual results, go checkout our <a href="https://skhu101.github.io/GauHuman" target="_blank">project page</a>
+## Layout
+| Path | What |
+|---|---|
+| `vpskin/skinning.py` | `lbs`, `dqs`, `blend`, `quatavg` (arXiv 2509.11411 comparator), `volume_factor` |
+| `vpskin/regularizers.py` | `knn_graph`, `iso_loss`, `vol_loss`, `beta_smooth_loss`, plus metrics `neighbour_drift` and `part_volume_ratio` |
+| `vpskin/knn_fallback.py` | pure-torch stand-in for `knn_cuda` |
+| `utils/runlog.py` | peak VRAM, wall-clock, GPU-hours → `results/runs.csv` (hooked into `train.py` and `render.py`) |
+| `tools/clean_smpl.py` | strips chumpy from the official SMPL pickle, so no chumpy install is needed |
+| `tests/` | `pytest` checks of Props 1–2, DQS sanity, regularisers, logger |
+| `notebooks/vpskin_kaggle.ipynb` | end-to-end Kaggle notebook (T4, 16 GB) |
 
-This repository will contain the official implementation of _GauHuman: Articulated Gaussian Splatting from Monocular Human Videos_.
+## Setup
+**Data.** Licences forbid redistribution, so request each dataset yourself:
+- SMPL (neutral model, from the SMPLify download): https://smplify.is.tue.mpg.de. Then run `python tools/clean_smpl.py <basicModel_neutral_…pkl> assets/SMPL_NEUTRAL.pkl`.
+- ZJU-MoCap-refine: follow [Instant-NVR's instructions](https://github.com/zju3dv/instant-nvr/blob/master/docs/install.md#set-up-datasets). This needs the ZJU-MoCap request form. Then link it as `data/zju_mocap_refine`.
+- AMASS (for unseen motions): https://amass.is.tue.mpg.de
 
-<div align="left">
+**Kaggle (recommended).** Upload the data above as *private* datasets. Open `notebooks/vpskin_kaggle.ipynb`, choose GPU T4, set `REPO_URL`, and run all cells.
 
-## :mega: Updates
-[12/2023] Training and inference codes for ZJU-Mocap_refine and MonoCap are released.
-
-## :desktop_computer: Requirements
-<!-- --- -->
-NVIDIA GPUs are required for this project.
-We recommend using anaconda to manage the python environments.
-
+**Local (Linux or WSL2).**
 ```bash
-    conda create --name gauhuman python=3.8
-    conda activate gauhuman
-    conda install pytorch==2.0.0 torchvision==0.15.0 torchaudio==2.0.0 pytorch-cuda=11.8 -c pytorch -c nvidia
-    pip install submodules/diff-gaussian-rasterization
-    pip install submodules/simple-knn
-    pip install --upgrade https://github.com/unlimblue/KNN_CUDA/releases/download/0.2/KNN_CUDA-0.2-py3-none-any.whl
-    pip install -r requirement.txt
+pip install torch torchvision          # any recent CUDA build
+pip install --no-build-isolation submodules/diff-gaussian-rasterization submodules/simple-knn
+pip install plyfile lpips==0.1.4 tqdm imageio opencv-python pytest
+python -m pytest -q tests              # the skinning tests also run on CPU-only torch
 ```
 
-Tips: We implement the [alpha mask loss version](https://github.com/ashawkey/diff-gaussian-rasterization) based on the official [diff-gaussian-rasterization](https://github.com/graphdeco-inria/diff-gaussian-rasterization/tree/59f5f77e3ddbac3ed9db93ec2cfe99ed6c5d121d).
-
-## Set up Dataset
-<!-- --- -->
-
-Please follow instructions of [Instant-NVR](https://github.com/zju3dv/instant-nvr/blob/master/docs/install.md#set-up-datasets) to download ZJU-Mocap-Refine and MonoCap dataset.
-
-
-## Download SMPL Models
-
-Register and download SMPL models [here](https://smplify.is.tue.mpg.de/download.php). Put the downloaded models in the folder smpl_models. Only the neutral one is needed. The folder structure should look like
-
-```
-./
-├── ...
-└── assets/
-    ├── SMPL_NEUTRAL.pkl
-```
-
-## :train: Training
-<!-- --- -->
-
-### Training command on ZJU_MoCap_refine dataset
+## Baseline reproduction (B0)
 ```bash
-bash run_zju_mocap_refine.sh
+bash train_zju_mocap_refine.sh && bash eval_zju_mocap_refine.sh
 ```
+- Target (GauHuman paper, Table 1, average of 6 subjects): **PSNR 31.34, SSIM 0.965, LPIPS\* 30.51** (LPIPS-VGG × 1000).
+- The metric code is GauHuman's, unchanged. We only add `torch.cuda.synchronize()` so the FPS figure measures GPU time.
 
-### Training command on MonoCap dataset
-```bash
-bash run_monocap.sh
-```
-
-## :running_woman: Evaluation
-<!-- --- -->
-
-### Evaluation command on ZJU_MoCap_refine dataset
-```bash
-bash eval_zju_mocap_refine.sh
-```
-
-### Evaluation command on MonoCap dataset
-```bash
-bash eval_monocap.sh
-```
-
-## :love_you_gesture: Citation
-<!-- --- -->
-
-If you find the codes of this work or the associated ReSynth dataset helpful to your research, please consider citing:
-
-```bibtex
-@article{hu2023gauhuman,
-  title={GauHuman: Articulated Gaussian Splatting from Monocular Human Videos},
-  author={Hu, Shoukang and Liu, Ziwei},
-  journal={arXiv preprint arXiv:},
-  year={2023}
-}
-```
-
-## :newspaper_roll: License
-
-Distributed under the S-Lab License. See `LICENSE` for more information.
-
-## :raised_hands: Acknowledgements
-
-This project is built on source codes shared by [Gaussian-Splatting](https://github.com/graphdeco-inria/gaussian-splatting), [HumanNeRF](https://github.com/chungyiweng/humannerf) and [Animatable NeRF](https://github.com/zju3dv/animatable_nerf).
+## Results
+To be filled in from `results/runs.csv` and `output/**/metrics_*.json`.

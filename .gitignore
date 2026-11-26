@@ -8,3 +8,13 @@ tensorboard_3d
 screenshots
 assets/
 *.png
+# [vpskin]
+output/
+assets/*.pkl
+data/zju_mocap_refine
+data/people_snapshot*
+data/amass*
+*.whl
+__pycache__/
+.pytest_cache/
+!results/**/*.png
